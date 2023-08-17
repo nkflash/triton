@@ -1,4 +1,5 @@
 import triton
+from triton.runtime import driver
 import triton._C.libtriton.triton as _triton
 from triton.ops.matmul_perf_model import get_dram_gbps as get_dram_gbps
 from triton.ops.matmul_perf_model import get_tflops as get_tflops
@@ -7,9 +8,8 @@ import torch
 
 
 def early_config_prune(configs, named_args):
-    backend = _triton.runtime.backend.CUDA
     device = torch.cuda.current_device()
-    cc = _triton.runtime.cc(backend, device)
+    capability = torch.cuda.get_device_capability()
     # BLOCK_M, BLOCK_N, BLOCK_K, SPLIT_K, num_warps, num_stages
     dtsize = named_args["x"].element_size()
     # dtype = named_args["x"].dtype
@@ -24,7 +24,7 @@ def early_config_prune(configs, named_args):
             kw["BLOCK_K"],
             config.num_stages,
         )
-        max_shared_memory = _triton.runtime.max_shared_memory(backend, device)
+        max_shared_memory = driver.utils.get_device_properties(device)["max_shared_mem"]
         required_shared_memory = (BLOCK_M + BLOCK_N) * BLOCK_K * num_stages * dtsize
         if required_shared_memory <= max_shared_memory:
             pruned_configs.append(config)
@@ -51,7 +51,7 @@ def early_config_prune(configs, named_args):
     pruned_configs = []
     for k, v in configs_map.items():
         BLOCK_M, BLOCK_N, BLOCK_K, num_warps = k
-        if cc >= 80:
+        if capability[0] >= 8:
             # compute cycles (only works for ampere GPUs)
             mmas = BLOCK_M * BLOCK_N * BLOCK_K / (16 * 8 * 16)
             mma_cycles = mmas / min(4, num_warps) * 8
@@ -121,7 +121,7 @@ def estimate_conv_time(
     compute_ms = total_ops / tput
 
     # time to load data
-    num_sm = _triton.runtime.num_sm(backend, device)
+    num_sm = driver.utils.get_device_properties(device)["multiprocessor_count"]
     active_cta_ratio = min(1, num_ctas / num_sm)
     active_cta_ratio_bw1 = min(
         1, num_ctas / 32

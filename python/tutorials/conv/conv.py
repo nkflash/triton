@@ -2,8 +2,8 @@ import torch
 import triton
 import triton.language as tl
 
-from .config import conv_heuristics
-from .utils import _unpack
+from config import conv_heuristics
+from utils import _unpack
 
 
 @conv_heuristics()

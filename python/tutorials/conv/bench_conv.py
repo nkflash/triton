@@ -2,15 +2,13 @@ import model
 import torch
 import triton
 
-from .conv import conv2d
+import conv
 
 # The flag below controls whether to allow TF32 on matmul. This flag defaults to True.
 torch.backends.cuda.matmul.allow_tf32 = True
 # The flag below controls whether to allow TF32 on cuDNN. This flag defaults to True.
 torch.backends.cudnn.allow_tf32 = True
 
-# https://pytorch.org/blog/accelerating-pytorch-with-cuda-graphs/
-useCudaGraph = False
 
 # conv benchmarks
 conv_confs = [
@@ -107,37 +105,12 @@ def bench_op(
     elif provider == "triton":
 
         def fn():
-            return conv2d(
+            return conv.conv2d(
                 x, w, bias, stride, padding, dilation, False, (0, 0), groups
             )
 
-    # useCudaGraph won't change the TFLOPs,
-    # because do_bench() clear L2 cache to hide the latency of CPU launch time
-    if useCudaGraph:
-        new_x = x.clone()
-        new_w = w.clone()
-        new_bias = bias.clone()
-
-        # warmp up for cudagraph
-        s = torch.cuda.Stream()
-        s.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(s):
-            for i in range(3):
-                fn()
-        torch.cuda.current_stream().wait_stream(s)
-
-        # capture
-        g = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(g):
-            fn()
-
-        def fn():
-            x.copy_(new_x)
-            w.copy_(new_w)
-            bias.copy_(new_bias)
-            return g.replay()
-
-    ms, min_ms, max_ms = triton.testing.do_bench(fn, warmup=warmup, rep=rep)
+    quantiles = [0.5, 0.2, 0.8]
+    ms, min_ms, max_ms = triton.testing.do_bench(fn, warmup=warmup, rep=rep, quantiles=quantiles)
     return tflops(ms), tflops(max_ms), tflops(min_ms)
 
 
