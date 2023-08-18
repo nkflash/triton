@@ -193,7 +193,6 @@ def _kernel_delta_x_hwc(
 
     tl.store(y_ptrs, acc, mask=mask_y)
 
-    return
 
 
 @conv_heuristics()
@@ -364,7 +363,6 @@ def _kernel_delta_x(
 
     tl.store(y_ptrs, acc, mask=mask_y)
 
-    return
 
 
 class _conv:
