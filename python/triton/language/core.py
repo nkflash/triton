@@ -6,8 +6,7 @@ from functools import wraps
 from typing import Callable, List, Sequence, TypeVar
 
 from .._C.libtriton.triton import ir
-from ..runtime.jit import jit
-from . import math, semantic
+from . import semantic
 
 T = TypeVar('T')
 
@@ -76,7 +75,7 @@ def _to_tensor(x, builder):
 class dtype:
     SINT_TYPES = ['int8', 'int16', 'int32', 'int64']
     UINT_TYPES = ['int1', 'uint8', 'uint16', 'uint32', 'uint64']
-    FP_TYPES = ['fp8e4b15', 'fp8e4b15x4', 'fp8e4', 'fp8e5', 'fp16', 'bf16', 'fp32', 'fp64']
+    FP_TYPES = ['fp8e4b15', 'fp8e4b15x4', 'fp8e4nv', 'fp8e5', 'fp16', 'bf16', 'fp32', 'fp64']
     STANDARD_FP_TYPES = ['fp16', 'bf16', 'fp32', 'fp64']
     OTHER_TYPES = ['void']
 
@@ -104,7 +103,7 @@ class dtype:
                 self.fp_mantissa_width = 3
                 self.primitive_bitwidth = 8
                 self.exponent_bias = 15
-            elif name == 'fp8e4':
+            elif name == 'fp8e4nv':
                 self.fp_mantissa_width = 3
                 self.primitive_bitwidth = 8
                 self.exponent_bias = 7
@@ -136,14 +135,17 @@ class dtype:
     def is_fp8(self):
         return 'fp8' in self.name
 
-    def is_fp8e4(self):
-        return self.name == 'fp8e4'
+    def is_fp8e4nv(self):
+        return self.name == 'fp8e4nv'
 
     def is_fp8e4b15(self):
         return self.name == 'fp8e4b15'
 
     def is_fp8e4b15x4(self):
         return self.name == 'fp8e4b15x4'
+
+    def is_fp8e5(self):
+        return self.name == 'fp8e5'
 
     def is_fp16(self):
         return self.name == 'fp16'
@@ -203,6 +205,10 @@ class dtype:
         return self.is_int1()
 
     @staticmethod
+    def is_dtype(type_str):
+        return type_str in dtype.SINT_TYPES + dtype.UINT_TYPES + dtype.FP_TYPES + dtype.OTHER_TYPES
+
+    @staticmethod
     def is_void():
         raise RuntimeError("Not implemented")
 
@@ -244,8 +250,8 @@ class dtype:
             return builder.get_int64_ty()
         elif self.name == 'fp8e5':
             return builder.get_fp8e5_ty()
-        elif self.name == 'fp8e4':
-            return builder.get_fp8e4_ty()
+        elif self.name == 'fp8e4nv':
+            return builder.get_fp8e4nv_ty()
         elif self.name == 'fp8e4b15':
             return builder.get_fp8e4b15_ty()
         elif self.name == 'fp8e4b15x4':
@@ -269,7 +275,7 @@ class dtype:
         return self.name
 
     def __repr__(self):
-        return f'triton.language.{self.name}'
+        return f'triton.language.{str(self)}'
 
 
 class pointer_type(dtype):
@@ -382,7 +388,7 @@ uint16 = dtype('uint16')
 uint32 = dtype('uint32')
 uint64 = dtype('uint64')
 float8e5 = dtype('fp8e5')
-float8e4 = dtype('fp8e4')
+float8e4nv = dtype('fp8e4nv')
 float8e4b15 = dtype('fp8e4b15')
 float8e4b15x4 = dtype('fp8e4b15x4')
 float16 = dtype('fp16')
@@ -525,9 +531,7 @@ class tensor:
         # IR handle
         self.handle = handle
         # Block shape
-        self.shape = (1, )
-        if type.is_block():
-            self.shape = type.shape
+        self.shape = type.shape if type.is_block() else ()
         self.numel = 1
         for s in self.shape:
             self.numel *= s
@@ -538,14 +542,15 @@ class tensor:
         self.shape = [constexpr(s) for s in self.shape]
 
     def __str__(self) -> str:
-        # ex. "float32[3,4]"
-        return str(self.dtype) + '[' + ','.join(str(s) for s in self.shape) + ']'
+        # ex. "float32[16, 32]"
+        return str(self.dtype) + '[' + ', '.join(str(s) for s in self.shape) + ']'
 
     @builtin
     def __add__(self, other, _builder=None):
         other = _to_tensor(other, _builder)
         return semantic.add(self, other, _builder)
 
+    @builtin
     def __radd__(self, other, _builder=None):
         return self.__add__(other, _builder=_builder)
 
@@ -554,6 +559,7 @@ class tensor:
         other = _to_tensor(other, _builder)
         return semantic.sub(self, other, _builder)
 
+    @builtin
     def __rsub__(self, other, _builder=None):
         other = _to_tensor(other, _builder)
         return semantic.sub(other, self, _builder)
@@ -563,6 +569,7 @@ class tensor:
         other = _to_tensor(other, _builder)
         return semantic.mul(self, other, _builder)
 
+    @builtin
     def __rmul__(self, other, _builder=None):
         return self.__mul__(other, _builder=_builder)
 
@@ -571,6 +578,7 @@ class tensor:
         other = _to_tensor(other, _builder)
         return semantic.truediv(self, other, _builder)
 
+    @builtin
     def __rtruediv__(self, other, _builder=None):
         other = _to_tensor(other, _builder)
         return semantic.truediv(other, self, _builder)
@@ -662,8 +670,6 @@ class tensor:
         else:
             return semantic.lshr(other, self, _builder)
 
-    # comparison operators
-
     # >
     @builtin
     def __gt__(self, other, _builder=None):
@@ -737,11 +743,11 @@ class tensor:
 
     @builtin
     def __getitem__(self, slices, _builder=None):
-        if isinstance(slices, slice):
+        if isinstance(slices, (slice, constexpr)):
             slices = [slices]
         ret = self
         for dim, sl in enumerate(slices):
-            if isinstance(sl, constexpr) and sl.value is None:
+            if sl is None or isinstance(sl, constexpr) and sl.value is None:
                 ret = semantic.expand_dims(ret, dim, _builder)
             elif isinstance(sl, slice) and sl.start is None and sl.stop is None and sl.step is None:
                 pass
@@ -826,6 +832,8 @@ def arange(start, end, _builder=None):
 def _shape_check_impl(shape):
     shape = _constexpr_to_value(shape)
     for i, d in enumerate(shape):
+        if isinstance(d, int):
+            d = constexpr(d)
         if not isinstance(d, constexpr):
             raise TypeError(f"Shape element {i} must have type `constexpr`")
         if not isinstance(d.value, int):
@@ -884,6 +892,12 @@ def broadcast_to(input, shape, _builder=None):
 
 @builtin
 def trans(input, _builder=None):
+    """
+    Returns a transposed tensor.
+
+    :param input: The input tensor.
+    :type input:
+    """
     return semantic.trans(input, _builder)
 
 
@@ -922,6 +936,15 @@ def view(input, shape, _builder=None):
 
 @builtin
 def reshape(input, shape, _builder=None):
+    """
+    Returns a tensor with the same number of elements as input but with the
+    provided shape.
+
+    :param input: The input tensor.
+    :type input:
+    :param shape: The new shape.
+    :type shape: Tuple[int]
+    """
     shape = _shape_check_impl(shape)
     return semantic.reshape(input, shape, _builder)
 
@@ -966,7 +989,7 @@ def expand_dims(input, axis, _builder=None):
 
 
 @builtin
-def dot(input, other, allow_tf32=True, out_dtype=float32, _builder=None):
+def dot(input, other, acc=None, allow_tf32=True, max_num_imprecise_acc=None, out_dtype=float32, _builder=None):
     """
     Returns the matrix product of two blocks.
 
@@ -979,7 +1002,7 @@ def dot(input, other, allow_tf32=True, out_dtype=float32, _builder=None):
     """
     allow_tf32 = _constexpr_to_value(allow_tf32)
     out_dtype = _constexpr_to_value(out_dtype)
-    return semantic.dot(input, other, allow_tf32, out_dtype, _builder)
+    return semantic.dot(input, other, acc, allow_tf32, max_num_imprecise_acc, out_dtype, _builder)
 
 
 # -----------------------
@@ -1220,6 +1243,14 @@ def where(condition, x, y, _builder=None):
 
 @builtin
 def umulhi(x, y, _builder=None):
+    """
+    Returns the most significant 32 bits of the product of x and y.
+
+    :param x: the input tensor
+    :type x: int32
+    :param y: the input tensor
+    :type y: int32
+    """
     x = _to_tensor(x, _builder)
     y = _to_tensor(y, _builder)
     return semantic.umulhi(x, y, _builder)
@@ -1227,6 +1258,15 @@ def umulhi(x, y, _builder=None):
 
 @builtin
 def fdiv(x, y, ieee_rounding=False, _builder=None):
+    """
+    Returns a floating-point resultant tensor of dividing x by y.
+
+    :param x: the input numerator value.
+    :param y: the input denominator value.
+    :param ieee_rounding: To follow IEEE-754 floating point number
+    rounding mechanism
+    :type ieee_rounding: bool
+    """
     ieee_rounding = _constexpr_to_value(ieee_rounding)
     return semantic.fdiv(x, y, ieee_rounding, _builder)
 
@@ -1351,11 +1391,6 @@ def reduce(input, axis, combine_fn, _builder=None, _generator=None):
 @builtin
 def _promote_reduction_input(t, _builder=None):
     scalar_ty = t.type.scalar
-    # input is extended to 32-bits if necessary
-    # this increases numerical accuracy and can be done pretty much for free
-    # on GPUs
-    if scalar_ty.is_int() and scalar_ty.int_bitwidth < 32:
-        return t.to(int32, _builder=_builder)
 
     # hardware doesn't support FMAX, FMIN, CMP for bfloat16
     if scalar_ty is bfloat16:
@@ -1380,170 +1415,6 @@ def _reduce_with_indices(input, axis, combine_fn, _builder=None, _generator=None
     rvalue, rindices = reduce((input, index), axis, combine_fn,
                               _builder=_builder, _generator=_generator)
     return rvalue, rindices
-
-
-@jit
-def minimum(x, y):
-    """
-    Computes the element-wise minimum of :code:`x` and :code:`y`.
-
-    :param input: the first input tensor
-    :type input: Block
-    :param other: the second input tensor
-    :type other: Block
-    """
-    return math.min(x, y)
-
-
-@jit
-def maximum(x, y):
-    """
-    Computes the element-wise maximum of :code:`x` and :code:`y`.
-
-    :param input: the first input tensor
-    :type input: Block
-    :param other: the second input tensor
-    :type other: Block
-    """
-    return math.max(x, y)
-
-# max and argmax
-
-
-@jit
-def _argmax_combine(value1, index1, value2, index2, tie_break_left):
-    if tie_break_left:
-        tie = value1 == value2 and index1 < index2
-    else:
-        tie = False
-    gt = value1 > value2 or tie
-    v_ret = where(gt, value1, value2)
-    i_ret = where(gt, index1, index2)
-    return v_ret, i_ret
-
-
-@jit
-def _argmax_combine_tie_break_left(value1, index1, value2, index2):
-    return _argmax_combine(value1, index1, value2, index2, True)
-
-
-@jit
-def _argmax_combine_tie_break_fast(value1, index1, value2, index2):
-    return _argmax_combine(value1, index1, value2, index2, False)
-
-
-@jit
-@_add_reduction_docstr("maximum",
-                       return_indices_arg="return_indices",
-                       tie_break_arg="return_indices_tie_break_left")
-def max(input, axis=None, return_indices=False, return_indices_tie_break_left=True):
-    input = _promote_reduction_input(input)
-    if return_indices:
-        if return_indices_tie_break_left:
-            return _reduce_with_indices(input, axis, _argmax_combine_tie_break_left)
-        else:
-            return _reduce_with_indices(input, axis, _argmax_combine_tie_break_fast)
-    else:
-        if constexpr(input.dtype.primitive_bitwidth) < 32:
-            if constexpr(input.dtype.is_floating()):
-                input = input.to(float32)
-            else:
-                assert input.dtype.is_integer_type()
-                input = input.to(int32)
-        return reduce(input, axis, maximum)
-
-
-@jit
-@_add_reduction_docstr("maximum index", tie_break_arg="tie_break_left")
-def argmax(input, axis, tie_break_left=True):
-    (_, ret) = max(input, axis, return_indices=True, return_indices_tie_break_left=tie_break_left)
-    return ret
-
-# min and argmin
-
-
-@jit
-def _argmin_combine(value1, index1, value2, index2, tie_break_left):
-    if tie_break_left:
-        tie = value1 == value2 and index1 < index2
-    else:
-        tie = False
-    lt = value1 < value2 or tie
-    value_ret = where(lt, value1, value2)
-    index_ret = where(lt, index1, index2)
-    return value_ret, index_ret
-
-
-@jit
-def _argmin_combine_tie_break_left(value1, index1, value2, index2):
-    return _argmin_combine(value1, index1, value2, index2, True)
-
-
-@jit
-def _argmin_combine_tie_break_fast(value1, index1, value2, index2):
-    return _argmin_combine(value1, index1, value2, index2, False)
-
-
-@jit
-@_add_reduction_docstr("minimum",
-                       return_indices_arg="return_indices",
-                       tie_break_arg="return_indices_tie_break_left")
-def min(input, axis=None, return_indices=False, return_indices_tie_break_left=True):
-    input = _promote_reduction_input(input)
-    if return_indices:
-        if return_indices_tie_break_left:
-            return _reduce_with_indices(input, axis, _argmin_combine_tie_break_left)
-        else:
-            return _reduce_with_indices(input, axis, _argmin_combine_tie_break_fast)
-    else:
-        if constexpr(input.dtype.primitive_bitwidth) < 32:
-            if constexpr(input.dtype.is_floating()):
-                input = input.to(float32)
-            else:
-                assert input.dtype.is_integer_type()
-                input = input.to(int32)
-        return reduce(input, axis, minimum)
-
-
-@jit
-@_add_reduction_docstr("minimum index",
-                       tie_break_arg="tie_break_left")
-def argmin(input, axis, tie_break_left=True):
-    _, ret = min(input, axis, return_indices=True, return_indices_tie_break_left=tie_break_left)
-    return ret
-
-
-@jit
-def _sum_combine(a, b):
-    return a + b
-
-# sum
-
-
-@jit
-@_add_reduction_docstr("sum")
-def sum(input, axis=None):
-    input = _promote_reduction_input(input)
-    return reduce(input, axis, _sum_combine)
-
-
-@jit
-def _xor_combine(a, b):
-    return a ^ b
-
-
-# xor sum
-
-@builtin
-@_add_reduction_docstr("xor sum")
-def xor_sum(input, axis=None, _builder=None, _generator=None):
-    scalar_ty = input.type.scalar
-    if not scalar_ty.is_int():
-        raise ValueError("xor_sum only supported for integers")
-
-    input = _promote_reduction_input(input, _builder=_builder)
-    return reduce(input, axis, _xor_combine,
-                  _builder=_builder, _generator=_generator)
 
 
 # -----------------------
@@ -1595,31 +1466,6 @@ def associative_scan(input, axis, combine_fn, _builder=None, _generator=None):
             _builder.create_scan_ret(*handles)
     axis = _constexpr_to_value(axis)
     return semantic.associative_scan(input, axis, make_combine_region, _builder)
-
-# cumsum
-
-
-@jit
-@_add_scan_docstr("cumsum")
-def cumsum(input, axis=0):
-    # todo rename this to a generic function name
-    input = _promote_reduction_input(input)
-    return associative_scan(input, axis, _sum_combine)
-
-# cumprod
-
-
-@jit
-def _prod_combine(a, b):
-    return a * b
-
-
-@jit
-@_add_scan_docstr("cumprod")
-def cumprod(input, axis=0):
-    # todo rename this to a generic function name
-    input = _promote_reduction_input(input)
-    return associative_scan(input, axis, _prod_combine)
 
 # -----------------------
 # Compiler Hint Ops
@@ -1791,6 +1637,47 @@ def device_assert(cond, msg="", _builder=None):
         # device_assert is called. Need to enhance this.
         lineno = frame.f_back.f_lineno
     return semantic.device_assert(_to_tensor(cond, _builder), msg, file_name, func_name, lineno, _builder)
+
+
+@builtin
+def inline_asm_elementwise(asm: str, constraints: str, args: list, dtype, is_pure: bool, pack: int, _builder=None):
+    '''
+        Execute the inline assembly to a packed of elements of the tensor
+        :param asm: assembly to be inlined, it has to match the target assembly format
+        :param constraints: string representing the mapping of operands to register
+        :param args: the arguments of the operation
+        :param dtype: the element type of the returned variable
+        :param is_pure: whether the operation is pure
+        :param pack: the number of elements to be processed by one instance of inline assembly
+        :param _builder: the builder
+        :return: the return value of the function
+    '''
+    dispatch_args = args.copy()
+    asm = _constexpr_to_value(asm)
+    constraints = _constexpr_to_value(constraints)
+    pack = _constexpr_to_value(pack)
+    is_pure = _constexpr_to_value(is_pure)
+    ret_shape = None
+    arg_types = []
+    res_ty = dtype
+    for i in range(len(dispatch_args)):
+        dispatch_args[i] = _to_tensor(dispatch_args[i], _builder)
+        arg_types.append(dispatch_args[i].dtype)
+    if len(arg_types) > 0:
+        arg_types = tuple(arg_types)
+        broadcast_arg = dispatch_args[0]
+        # Get the broadcast shape over all the arguments
+        for i, item in enumerate(dispatch_args):
+            _, broadcast_arg = semantic.binary_op_type_checking_impl(
+                item, broadcast_arg, _builder, arithmetic_check=False)
+        # Change the shape of each argument based on the broadcast shape
+        for i in range(len(dispatch_args)):
+            dispatch_args[i], _ = semantic.binary_op_type_checking_impl(
+                dispatch_args[i], broadcast_arg, _builder, arithmetic_check=False)
+        ret_shape = broadcast_arg.shape
+        res_ty = block_type(dtype, ret_shape)
+    call = _builder.create_inline_asm(asm, constraints, [t.handle for t in args], res_ty.to_ir(_builder), is_pure, pack)
+    return tensor(call, res_ty)
 
 
 # -----------------------

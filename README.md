@@ -4,6 +4,7 @@
 
 [![Wheels](https://github.com/openai/triton/actions/workflows/wheels.yml/badge.svg?branch=release/2.0.x)](https://github.com/openai/triton/actions/workflows/wheels.yml)
 
+We're hiring! If you are interested in working on Triton at OpenAI, we have roles open for [Compiler Engineers](https://openai.com/careers/software-engineer-triton-compiler) and [Kernel Engineers](https://openai.com/careers/kernel-engineer).
 
 **`Documentation`** |
 ------------------- |
@@ -37,12 +38,64 @@ pip install -U --index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/
 
 ```
 git clone https://github.com/openai/triton.git;
-cd triton/python;
-pip install cmake; # build-time dependency
-pip install -e .
+cd triton;
+
+pip install ninja cmake; # build-time dependencies
+pip install -e python
 ```
 
+Or with a virtualenv:
 
+```
+git clone https://github.com/openai/triton.git;
+cd triton;
+
+python -m venv .venv --prompt triton;
+source .venv/bin/activate;
+
+pip install ninja cmake; # build-time dependencies
+pip install -e python
+```
+
+# Building with a custom LLVM
+
+Triton uses LLVM to generate code for GPUs and CPUs.  Normally, the Triton build
+downloads a prebuilt LLVM, but you can also build LLVM from source and use that.
+
+LLVM does not have a stable API, so the Triton build will not work at an
+arbitrary LLVM version.
+
+1. Find the version of LLVM that Triton builds against.  Check `python/setup.py`
+   for a line like
+
+       version = "llvm-17.0.0-c5dede880d17"
+
+   This means that the version of Triton you have builds against
+   [LLVM](https://github.com/llvm/llvm-project) c5dede880d17.
+
+2. `git checkout` LLVM at this revision.  Optionally, make additional
+   modifications to LLVM.
+
+3. [Build LLVM](https://llvm.org/docs/CMake.html).  For example, you might run
+
+       $ cd $HOME/llvm-project  # your clone of LLVM.
+       $ mkdir build
+       $ cd build
+       $ cmake -G Ninja -DCMAKE_BUILD_TYPE=Release -DLLVM_ENABLE_ASSERTIONS=ON  ../llvm -DLLVM_ENABLE_PROJECTS="mlir;llvm"
+       $ ninja
+
+4. Grab a snack, this will take a while.
+
+5. Build Triton as above, but set the following environment variables.
+
+       # Modify as appropriate to point to your LLVM build.
+       $ export LLVM_BUILD_DIR=$HOME/llvm-project/build
+
+       $ cd <triton install>
+       $ LLVM_INCLUDE_DIRS=$LLVM_BUILD_DIR/include \
+         LLVM_LIBRARY_DIR=$LLVM_BUILD_DIR/lib \
+         LLVM_SYSPATH=$LLVM_BUILD_DIR \
+         pip install -e python
 
 # Changelog
 
@@ -55,10 +108,6 @@ Version 2.0 is out! New features include:
 # Contributing
 
 Community contributions are more than welcome, whether it be to fix bugs or to add new features at [github](https://github.com/openai/triton/). For more detailed instructions, please visit our [contributor's guide](CONTRIBUTING.md).
-
-If you’re interested in joining our team and working on Triton & GPU kernels, [we’re hiring](https://openai.com/jobs/#acceleration)!
-
-
 
 
 # Compatibility

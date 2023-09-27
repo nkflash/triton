@@ -16,6 +16,7 @@
 #include <mutex>
 #include <optional>
 
+#include <memory>
 #include <mutex>
 #include <optional>
 
@@ -43,25 +44,7 @@ static bool findAndReplace(std::string &str, const std::string &begin,
   return true;
 }
 
-static void linkExternal(llvm::Module &module) {
-  namespace fs = std::filesystem;
-
-  // TODO: enable generating bc file from clang.
-  static const auto this_file_path = std::filesystem::path(__FILE__);
-  static const auto path =
-      this_file_path.parent_path().parent_path().parent_path().parent_path() /
-      "python" / "triton" / "hopper_lib" / "libhopper_helpers.bc";
-
-  // static const std::filesystem::path path =
-  //     std::filesystem::path(__BUILD_DIR__) / "lib" / "Hopper" /
-  //     "libhopper_helpers.bc";
-  if (mlir::triton::linkExternLib(module, "libhopper_helpers", path.string(),
-                                  /*isROCM*/ false))
-    llvm::errs() << "Link failed for: libhopper_helpers.bc";
-}
-
 std::string translateLLVMIRToPTX(llvm::Module &module, int cc, int version) {
-  linkExternal(module);
   // LLVM version in use may not officially support target hardware.
   // Supported versions for LLVM 14 are here:
   // https://github.com/llvm/llvm-project/blob/f28c006a5895fc0e329fe15fead81e37457cb1d1/clang/include/clang/Basic/BuiltinsNVPTX.def
@@ -105,9 +88,9 @@ std::string translateLLVMIRToPTX(llvm::Module &module, int cc, int version) {
   opt.UnsafeFPMath = false;
   opt.NoInfsFPMath = false;
   opt.NoNaNsFPMath = true;
-  llvm::TargetMachine *machine = target->createTargetMachine(
+  std::unique_ptr<llvm::TargetMachine> machine{target->createTargetMachine(
       module.getTargetTriple(), proc, features, opt, llvm::Reloc::PIC_,
-      std::nullopt, llvm::CodeGenOpt::Aggressive);
+      std::nullopt, llvm::CodeGenOpt::Aggressive)};
   // set data layout
   if (layout.empty())
     module.setDataLayout(machine->createDataLayout());

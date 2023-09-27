@@ -203,8 +203,8 @@ LogicalResult Prefetcher::initialize() {
     auto bType = dot.getB().getType().cast<RankedTensorType>();
     auto aEnc = aType.getEncoding().cast<triton::gpu::DotOperandEncodingAttr>();
     auto bEnc = bType.getEncoding().cast<triton::gpu::DotOperandEncodingAttr>();
-    int aKWidth = aEnc.getMMAv2kWidth();
-    int bKWidth = bEnc.getMMAv2kWidth();
+    int aKWidth = aEnc.getKWidth();
+    int bKWidth = bEnc.getKWidth();
     assert(aKWidth == bKWidth);
 
     auto kSize = aType.getShape()[1];
@@ -269,7 +269,7 @@ scf::ForOp Prefetcher::createNewForOp() {
   OpBuilder builder(forOp);
 
   SmallVector<Value> loopArgs;
-  for (auto v : forOp.getIterOperands())
+  for (auto v : forOp.getInitArgs())
     loopArgs.push_back(v);
   for (Value dot : dots) {
     loopArgs.push_back(

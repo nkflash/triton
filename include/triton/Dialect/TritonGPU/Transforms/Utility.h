@@ -19,8 +19,6 @@ class SharedEncodingAttr;
 }
 } // namespace triton
 
-LogicalResult fixupLoops(ModuleOp mod);
-
 SmallVector<unsigned, 3> mmaVersionToInstrShape(int version,
                                                 const ArrayRef<int64_t> &shape,
                                                 RankedTensorType type);
@@ -103,31 +101,28 @@ protected:
   std::string getColor(const Type &type) const;
 };
 
-// TODO: Interface
-LogicalResult invertEncoding(Attribute targetEncoding, Operation *op,
-                             Attribute &ret);
+// Infers the encoding of the result of op given the source encoding.
+std::optional<Attribute> inferDstEncoding(Operation *op, Attribute encoding);
 
-bool isExpensiveLoadOrStore(Operation *op, Attribute &targetEncoding);
+// Infers the encoding of the source of op given the result encoding.
+std::optional<Attribute> inferSrcEncoding(Operation *op, Attribute encoding);
 
-bool isExpensiveToRemat(Operation *op, Attribute &targetEncoding);
+bool isExpensiveLoadOrStore(Operation *op);
 
-// skipInit is True when we only consider the operands of the initOp but
-// not the initOp itself.
-int simulateBackwardRematerialization(
-    Operation *initOp, SetVector<Operation *> &processed,
-    SetVector<Attribute> &layout, llvm::MapVector<Value, Attribute> &toConvert,
-    Attribute targetEncoding);
+bool canFoldIntoConversion(Operation *op, Attribute targetEncoding);
 
 Operation *cloneWithInferType(mlir::OpBuilder &rewriter, Operation *op,
                               IRMapping &mapping);
 
-void rematerializeConversionChain(
-    const llvm::MapVector<Value, Attribute> &toConvert,
-    mlir::PatternRewriter &rewriter, SetVector<Operation *> &processed,
-    IRMapping &mapping);
+// Get backward slice of tensor values starting from the root node along with
+// encoding propagation.
+LogicalResult getConvertBackwardSlice(
+    Value root, SetVector<Value> &slice, Attribute rootEncoding,
+    DenseMap<Value, Attribute> &layout,
+    std::function<bool(Operation *)> stopPropagation = nullptr);
 
-LogicalResult canMoveOutOfLoop(BlockArgument arg,
-                               SmallVector<Operation *> &cvts);
+// Populate pattern to remove dead cycles in ForOp.
+void populateForOpDeadArgumentElimination(RewritePatternSet &patterns);
 
 // Convert an \param index to a multi-dim coordinate given \param shape and
 // \param order.
@@ -146,12 +141,15 @@ Value linearize(OpBuilder &b, Location loc, ArrayRef<Value> multiDim,
 Value linearize(OpBuilder &b, Location loc, ArrayRef<Value> multiDim,
                 ArrayRef<unsigned> shape);
 
-// Returns null if the op is not inside a agent region (warp specialization
-// mode). Note that there should be at most one agent id attached to the
-// operation.
-std::optional<int> getWSAgentId(Operation *op);
-std::optional<int> getWSRoleId(Operation *op);
-void setRoleId(Operation *op, int roleId);
+// Implement backward and forward slice that will go through scf blocks when
+// yield or scf results are in the slice.
+// Note that like exisiting forward and backard slice this may add operations to
+// the slice that are not actually dependent on the root because when a region
+// is added to the slice in the forward slice all the operations of the region
+// are added. We could implement a more accurate slice method by tracking value
+// usage across scf regions.
+void getBackwardSliceSCFAware(Operation *, SetVector<Operation *> *slices);
+void getForwardSliceSCFAware(Value root, SetVector<Operation *> *slices);
 
 } // namespace mlir
 

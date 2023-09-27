@@ -3,6 +3,7 @@ import os
 import subprocess
 import sys
 from contextlib import contextmanager
+from typing import Any, Dict, List
 
 from . import language as tl
 from ._C.libtriton.triton import runtime
@@ -31,8 +32,11 @@ def do_bench_cudagraph(fn, rep=20, grad_to_none=None):
     """
     if torch.cuda.current_stream() == torch.cuda.default_stream():
         raise RuntimeError("Cannot capture graph in default stream. Please use side stream in benchmark code.")
-    # record CUDAGraph
+    # warmup
     fn()
+    # step 1 - we estimate the amount of time the kernel call takes
+    # NOTE: this estimate isn't super accurate because the GPU isn't warmed up at this point
+    #       but it is probably good enough
     if grad_to_none is not None:
         for x in grad_to_none:
             x.detach_()
@@ -42,39 +46,35 @@ def do_bench_cudagraph(fn, rep=20, grad_to_none=None):
     with torch.cuda.graph(g):
         fn()
     torch.cuda.synchronize()
-    fn = lambda: g.replay()
-    # Estimate the runtime of the function
     start_event = torch.cuda.Event(enable_timing=True)
     end_event = torch.cuda.Event(enable_timing=True)
     start_event.record()
-    fn()
+    g.replay()
     end_event.record()
     torch.cuda.synchronize()
     estimate_ms = start_event.elapsed_time(end_event)
-    # compute number of repetition to last `rep` ms
     n_repeat = max(1, int(rep / estimate_ms))
-    # compute number of repetition to last `rep` ms
-    start_event = [torch.cuda.Event(enable_timing=True) for i in range(n_repeat)]
-    end_event = [torch.cuda.Event(enable_timing=True) for i in range(n_repeat)]
-    ret = []
-    n_retries = 50
-    for _ in range(n_retries):
-        # Benchmark
-        torch.cuda.synchronize()
+    # step 2 - construct a cuda graph with `n_repeat` unrolled function calls to minimize
+    # host overhead
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
         for i in range(n_repeat):
-            # we don't want `fn` to accumulate gradient values
-            # if it contains a backward pass. So we clear the
-            # provided gradients
             if grad_to_none is not None:
                 for x in grad_to_none:
                     x.grad = None
-            # record time of `fn`
-            start_event[i].record()
             fn()
-            end_event[i].record()
+    torch.cuda.synchronize()
+    # measure time and return
+    ret = []
+    n_retries = 10
+    for i in range(n_retries):
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        start_event.record()
+        g.replay()
+        end_event.record()
         torch.cuda.synchronize()
-        times = torch.tensor([s.elapsed_time(e) for s, e in zip(start_event, end_event)])
-        ret.append(torch.min(times))
+        ret += [start_event.elapsed_time(end_event) / n_repeat]
     return torch.mean(torch.tensor(ret)).item()
 
 
@@ -201,37 +201,41 @@ class Benchmark:
 
     def __init__(
         self,
-        x_names,
-        x_vals,
-        line_arg,
-        line_vals,
-        line_names,
-        plot_name,
-        args,
-        xlabel='',
-        ylabel='',
-        x_log=False,
-        y_log=False,
+        x_names: List[str],
+        x_vals: List[Any],
+        line_arg: str,
+        line_vals: List[Any],
+        line_names: List[str],
+        plot_name: str,
+        args: Dict[str, Any],
+        xlabel: str = '',
+        ylabel: str = '',
+        x_log: bool = False,
+        y_log: bool = False,
         color=None,
         styles=None,
     ):
         """
-        Constructor
+        Constructor.
+        x_vals can be a list of scalars or a list of tuples/lists. If x_vals is a list
+        of scalars and there are multiple x_names, all arguments will have the same value.
+        If x_vals is a list of tuples/lists, each element should have the same length as
+        x_names.
 
-        :param x_names: Name of the arguments that should appear on the x axis of the plot. If the list contains more than one element, all the arguments are assumed to have the same value.
+        :param x_names: Name of the arguments that should appear on the x axis of the plot.
         :type x_names: List[str]
         :param x_vals: List of values to use for the arguments in :code:`x_names`.
         :type x_vals: List[Any]
         :param line_arg: Argument name for which different values correspond to different lines in the plot.
         :type line_arg: str
         :param line_vals: List of values to use for the arguments in :code:`line_arg`.
-        :type line_vals: List[str]
+        :type line_vals: List[Any]
         :param line_names: Label names for the different lines.
         :type line_names: List[str]
         :param plot_name: Name of the plot.
         :type plot_name: str
-        :param args: List of arguments to remain fixed throughout the benchmark.
-        :type args: List[str]
+        :param args: Dictionary of keyword arguments to remain fixed throughout the benchmark.
+        :type args: Dict[str, Any]
         :param xlabel: Label for the x axis of the plot.
         :type xlabel: str, optional
         :param ylabel: Label for the y axis of the plot.
@@ -261,7 +265,7 @@ class Mark:
         self.fn = fn
         self.benchmarks = benchmarks
 
-    def _run(self, bench, save_path, show_plots, print_data):
+    def _run(self, bench: Benchmark, save_path: str, show_plots: bool, print_data: bool, **kwrags):
         import os
 
         import matplotlib.pyplot as plt
@@ -269,18 +273,20 @@ class Mark:
         y_mean = bench.line_names
         y_min = [f'{x}-min' for x in bench.line_names]
         y_max = [f'{x}-max' for x in bench.line_names]
-        x_names_str = str(bench.x_names)
-        df = pd.DataFrame(columns=[x_names_str] + y_mean + y_min + y_max)
+        x_names = list(bench.x_names)
+        df = pd.DataFrame(columns=x_names + y_mean + y_min + y_max)
         for x in bench.x_vals:
-            if not isinstance(x, list):
-                x = [x]
-            if len(x) == 1:
-                x = x * len(bench.x_names)
-            x_str = str(x)
-            x_args = {x_name: x_in for x_name, x_in in zip(bench.x_names, x)}
+            # x can be a single value or a sequence of values.
+            if not isinstance(x, (list, tuple)):
+                x = [x for _ in x_names]
+
+            if len(x) != len(x_names):
+                raise ValueError(f"Expected {len(x_names)} values, got {x}")
+            x_args = dict(zip(x_names, x))
+
             row_mean, row_min, row_max = [], [], []
             for y in bench.line_vals:
-                ret = self.fn(**x_args, **{bench.line_arg: y}, **bench.args)
+                ret = self.fn(**x_args, **{bench.line_arg: y}, **bench.args, **kwrags)
                 try:
                     y_mean, y_min, y_max = ret
                 except TypeError:
@@ -288,23 +294,24 @@ class Mark:
                 row_mean += [y_mean]
                 row_min += [y_min]
                 row_max += [y_max]
-            df.loc[len(df)] = [x_str] + row_mean + row_min + row_max
+            df.loc[len(df)] = list(x) + row_mean + row_min + row_max
+
         if bench.plot_name:
             plt.figure()
             ax = plt.subplot()
-            x = x_names_str
+            # Plot first x value on x axis if there are multiple.
+            first_x = x_names[0]
             for i, y in enumerate(bench.line_names):
                 y_min, y_max = df[y + '-min'], df[y + '-max']
                 col = bench.styles[i][0] if bench.styles else None
                 sty = bench.styles[i][1] if bench.styles else None
-                ax.plot(df[x], df[y], label=y, color=col, ls=sty)
+                ax.plot(df[first_x], df[y], label=y, color=col, ls=sty)
                 if not y_min.isnull().all() and not y_max.isnull().all():
                     y_min = y_min.astype(float)
                     y_max = y_max.astype(float)
-                    ax.fill_between(df[x], y_min, y_max, alpha=0.15, color=col)
+                    ax.fill_between(df[first_x], y_min, y_max, alpha=0.15, color=col)
             ax.legend()
-            xlabel = bench.xlabel if bench.xlabel else " = ".join(bench.x_names)
-            ax.set_xlabel(xlabel)
+            ax.set_xlabel(bench.xlabel or first_x)
             ax.set_ylabel(bench.ylabel)
             # ax.set_title(bench.plot_name)
             ax.set_xscale("log" if bench.x_log else "linear")
@@ -313,21 +320,21 @@ class Mark:
                 plt.show()
             if save_path:
                 plt.savefig(os.path.join(save_path, f"{bench.plot_name}.png"))
-        df = df[[x_names_str] + bench.line_names]
+        df = df[x_names + bench.line_names]
         if print_data:
             print(bench.plot_name + ':')
             print(df)
         if save_path:
             df.to_csv(os.path.join(save_path, f"{bench.plot_name}.csv"), float_format='%.1f', index=False)
 
-    def run(self, show_plots=False, print_data=False, save_path=''):
+    def run(self, show_plots=False, print_data=False, save_path='', **kwargs):
         has_single_bench = isinstance(self.benchmarks, Benchmark)
         benchmarks = [self.benchmarks] if has_single_bench else self.benchmarks
         if save_path:
             html = open(os.path.join(save_path, "results.html"), "w")
             html.write("<html><body>\n")
         for bench in benchmarks:
-            self._run(bench, save_path, show_plots, print_data)
+            self._run(bench, save_path, show_plots, print_data, **kwargs)
             if save_path:
                 html.write(f"<image src=\"{bench.plot_name}.png\"/>\n")
         if save_path:
@@ -360,7 +367,7 @@ def get_dram_gbps(backend=None, device=None):
     return bw_gbps
 
 
-def get_max_tensorcore_tflops(dtype, backend=None, device=None, clock_rate=None):
+def get_max_tensorcore_tflops(dtype, clock_rate, backend=None, device=None):
     import torch
 
     from .runtime import driver
@@ -370,18 +377,16 @@ def get_max_tensorcore_tflops(dtype, backend=None, device=None, clock_rate=None)
         device = torch.cuda.current_device()
 
     num_subcores = driver.utils.get_device_properties(device)["multiprocessor_count"] * 4
-    if not clock_rate:
-        clock_rate = driver.utils.get_device_properties(device)["sm_clock_rate"]  # in kHz
     capability = torch.cuda.get_device_capability(device)
     if capability[0] < 8:
         assert dtype == torch.float16
         ops_per_sub_core = 256  # 2 4x4x4 Tensor Cores
     else:
-        if dtype == torch.float32:
+        if dtype in [torch.float32, torch.int32]:
             ops_per_sub_core = 256
-        elif dtype in [torch.float16, torch.bfloat16]:
+        elif dtype in [torch.float16, torch.bfloat16, torch.int16]:
             ops_per_sub_core = 512
-        elif dtype in [torch.int8, tl.float8e4, tl.float8e4b15, tl.float8e5]:
+        elif dtype in [torch.int8, tl.float8e4nv, tl.float8e4b15, tl.float8e5]:
             ops_per_sub_core = 1024
         else:
             raise RuntimeError("dtype not supported")
@@ -415,21 +420,6 @@ def cuda_memcheck(**target_kwargs):
     return decorator
 
 
-def nvsmi_attr(attrs):
-    attrs = ",".join(attrs)
-    cmd = [
-        "nvidia-smi",
-        "-i",
-        "0",
-        "--query-gpu=" + attrs,
-        "--format=csv,noheader,nounits",
-    ]
-    out = subprocess.check_output(cmd)
-    ret = out.decode(sys.stdout.encoding).split(",")
-    ret = [int(x) for x in ret]
-    return ret
-
-
 @contextmanager
 def set_gpu_clock(ref_sm_clock=1350, ref_mem_clock=1215):
     try:
@@ -450,8 +440,8 @@ def set_gpu_clock(ref_sm_clock=1350, ref_mem_clock=1215):
                 f"--lock-memory-clocks={ref_mem_clock},{ref_mem_clock}",
             ]
         )
-        cur_sm_clock = nvsmi_attr(["clocks.current.sm"])[0]
-        cur_mem_clock = nvsmi_attr(["clocks.current.memory"])[0]
+        cur_sm_clock = nvsmi(["clocks.current.sm"])[0]
+        cur_mem_clock = nvsmi(["clocks.current.memory"])[0]
         assert abs(cur_sm_clock - ref_sm_clock) < 10, f"GPU SMs must run at {ref_sm_clock} MHz"
         assert abs(cur_mem_clock - ref_mem_clock) < 10, f"GPU SMs must run at {ref_mem_clock} MHz"
         tflops = 1e-6 * 2 * 108 * 4 * 256 * ref_sm_clock
@@ -463,7 +453,7 @@ def set_gpu_clock(ref_sm_clock=1350, ref_mem_clock=1215):
         subprocess.check_output(["nvidia-smi", "-i", "0", "-rmc"])
 
 
-def get_max_simd_tflops(dtype, backend=None, device=None):
+def get_max_simd_tflops(dtype, clock_rate, backend=None, device=None):
     import torch
 
     from .runtime import driver
@@ -473,7 +463,6 @@ def get_max_simd_tflops(dtype, backend=None, device=None):
         device = torch.cuda.current_device()
 
     num_subcores = driver.utils.get_device_properties(device)["multiprocessor_count"] * 4
-    clock_rate = driver.utils.get_device_properties(device)["sm_clock_rate"]  # in kHz
     capability = torch.cuda.get_device_capability()
     if capability[0] < 8:
         if dtype == torch.float32:

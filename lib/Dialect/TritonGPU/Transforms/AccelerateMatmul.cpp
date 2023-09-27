@@ -24,7 +24,7 @@ using ttg::SliceEncodingAttr;
 // supported
 static int getMMAVersionSafe(int computeCapability, tt::DotOp op) {
   int baseVersion = 0;
-  if (computeCapability < 80) {
+  if (computeCapability < 75) {
     baseVersion = 1;
   } else if (computeCapability < 90) {
     baseVersion = 2;
@@ -43,17 +43,6 @@ static int getMMAVersionSafe(int computeCapability, tt::DotOp op) {
   return 0;
 }
 
-SmallVector<int64_t, 2> mmaVersionToShapePerWarp(int version) {
-  if (version == 1)
-    return {16, 16};
-  else if (version == 2)
-    return {16, 8};
-  else {
-    assert(false && "version not supported");
-    return {0, 0};
-  }
-}
-
 SmallVector<unsigned, 2>
 warpsPerTileV2(tt::DotOp dotOp, const ArrayRef<int64_t> shape, int numWarps) {
   auto filter = [&dotOp](Operation *op) {
@@ -66,13 +55,11 @@ warpsPerTileV2(tt::DotOp dotOp, const ArrayRef<int64_t> shape, int numWarps) {
 
   SmallVector<unsigned, 2> ret = {1, 1};
   SmallVector<int64_t, 2> shapePerWarp = {16, 8};
-  bool changed = false;
   // TODO (@daadaada): double-check.
   // original logic in
   // https://github.com/openai/triton/blob/master/lib/codegen/analysis/layout.cc#L252
   // seems buggy for shape = [32, 16] ?
   do {
-    changed = false;
     if (ret[0] * ret[1] >= numWarps)
       break;
     if (shape[0] / shapePerWarp[0] / ret[0] >=
@@ -115,6 +102,7 @@ warpsPerTileV3(tt::DotOp dotOp, const ArrayRef<int64_t> shape, int numWarps,
 class BlockedToMMA : public mlir::RewritePattern {
   int computeCapability;
   mutable int mmaV1Counter{}; // used to generate ID for MMAv1 encoding
+  mutable llvm::DenseMap<Operation *, unsigned> dotOpInstNs;
 
   static bool bwdFilter(Operation *op) {
     return op->getNumOperands() == 1 &&
@@ -157,10 +145,40 @@ public:
     }
   }
 
+  unsigned getMmaV3InstrN(tt::DotOp dotOp, unsigned currN) const {
+    auto type = dotOp.getResult().getType().cast<RankedTensorType>();
+    if (type.getEncoding().isa<MmaEncodingAttr>())
+      return currN;
+    auto it = dotOpInstNs.find(dotOp.getOperation());
+    if (it != dotOpInstNs.end())
+      return it->second;
+
+    SetVector<Operation *> slices;
+    mlir::getForwardSliceSCFAware(dotOp.getResult(), &slices);
+    mlir::getBackwardSliceSCFAware(dotOp.getOperation(), &slices);
+    unsigned N = currN;
+    SmallVector<Operation *> dotOps;
+    for (Operation *iter : slices) {
+      if (auto nextDotOp = dyn_cast<tt::DotOp>(iter)) {
+        auto type = nextDotOp.getResult().getType().cast<RankedTensorType>();
+        auto AType = nextDotOp.getOperand(0).getType().cast<RankedTensorType>();
+        auto shapePerCTA = ttg::getShapePerCTA(type);
+        auto instrShape = mmaVersionToInstrShape(3, shapePerCTA, AType);
+        dotOps.push_back(iter);
+        if (instrShape[1] < N)
+          N = instrShape[1];
+      }
+    }
+    for (Operation *dotOp : dotOps)
+      dotOpInstNs[dotOp] = N;
+    return N;
+  }
+
   static Value getMMAv3Operand(Value v, mlir::PatternRewriter &rewriter,
                                int opIdx) {
-    auto cvtOp = dyn_cast_or_null<ttg::ConvertLayoutOp>(v.getDefiningOp());
-    auto arg = cvtOp.getSrc();
+    Value arg = v;
+    if (auto cvtOp = v.getDefiningOp<ttg::ConvertLayoutOp>())
+      arg = cvtOp.getSrc();
     auto argType = arg.getType().cast<RankedTensorType>();
     auto eltType = argType.getElementType();
     assert(argType.getEncoding() && "unexpected tensor type");
@@ -214,6 +232,8 @@ public:
 
     auto instrShape =
         mmaVersionToInstrShape(versionMajor, retShapePerCTA, AType);
+    if (versionMajor == 3)
+      instrShape[1] = getMmaV3InstrN(dotOp, instrShape[1]);
 
     // operands
     Value a = dotOp.getA();
@@ -255,11 +275,12 @@ public:
           instrShape, oldAType.getShape(), oldBType.getShape(), retShapePerCTA,
           isARow, isBRow, mmaV1Counter++);
     } else if (versionMajor == 2 || versionMajor == 3) {
+      int versionMinor = computeCapability == 75 ? 1 : 0;
       auto warpsPerTile = getWarpsPerTile(dotOp, retShapePerCTA, versionMajor,
                                           numWarps, instrShape);
       mmaEnc = ttg::MmaEncodingAttr::get(oldRetType.getContext(), versionMajor,
-                                         0 /*versionMinor*/, warpsPerTile,
-                                         CTALayout, instrShape);
+                                         versionMinor, warpsPerTile, CTALayout,
+                                         instrShape);
     }
     auto newRetType = RankedTensorType::get(
         oldRetType.getShape(), oldRetType.getElementType(), mmaEnc);
@@ -294,7 +315,8 @@ public:
     }
     // convert dot instruction
     auto newDot = rewriter.create<tt::DotOp>(dotOp.getLoc(), newRetType, a, b,
-                                             newAcc, dotOp.getAllowTF32());
+                                             newAcc, dotOp.getAllowTF32(),
+                                             dotOp.getMaxNumImpreciseAcc());
 
     rewriter.replaceOpWithNewOp<ttg::ConvertLayoutOp>(op, oldRetType,
                                                       newDot.getResult());

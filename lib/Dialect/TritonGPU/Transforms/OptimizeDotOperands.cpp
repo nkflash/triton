@@ -60,9 +60,14 @@ public:
     // used here. For tests where numCTAs = 1, this is not a problem since all
     // CTALayouts are the same.
     auto newXOrder = triton::gpu::getOrder(argEncoding);
+    // set needTrans to true here. newXEncoding is computed based on argEncoding
+    // which is before the transpose. without needTrans we will compute vec and
+    // maxPhase based on incorrect m, n and k size of mma. the type inference of
+    // TransOp simply swap the order but doesn't fix the vec and maxPhase for
+    // the YType, hence it would causing incorrect swizzling code.
     auto newXEncoding = triton::gpu::SharedEncodingAttr::get(
         getContext(), ZEncoding, XType.getShape(), newXOrder,
-        XEncoding.getCTALayout(), XType.getElementType());
+        XEncoding.getCTALayout(), XType.getElementType(), true);
     auto newXType = RankedTensorType::get(XType.getShape(),
                                           XType.getElementType(), newXEncoding);
     if (XEncoding == newXEncoding)
@@ -120,6 +125,9 @@ public:
     if (!isa<triton::FpToFpOp, triton::BitcastOp>(cvtArgOp) &&
         cvtArgOp->getDialect()->getTypeID() !=
             mlir::TypeID::get<arith::ArithDialect>())
+      return mlir::failure();
+    // not handled in elementwise lowering.
+    if (isa<arith::TruncIOp, arith::TruncFOp>(cvtArgOp))
       return mlir::failure();
     // only considers conversions to dot operand
     if (!cvtTy.getEncoding().isa<triton::gpu::DotOperandEncodingAttr>())
@@ -223,6 +231,42 @@ public:
   }
 };
 
+struct MMAV3UseRegOperand : public OpRewritePattern<triton::DotOp> {
+  using OpRewritePattern<triton::DotOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(triton::DotOp dotOp,
+                                PatternRewriter &rewriter) const override {
+    auto convertLhs =
+        dotOp.getOperand(0).getDefiningOp<triton::gpu::ConvertLayoutOp>();
+    if (!convertLhs)
+      return failure();
+    auto getEncoding = [](Value v) {
+      return v.getType().cast<RankedTensorType>().getEncoding();
+    };
+    if (!getEncoding(dotOp.getOperand(0)).isa<SharedEncodingAttr>())
+      return failure();
+    auto srcEncoding =
+        getEncoding(convertLhs.getSrc()).dyn_cast<MmaEncodingAttr>();
+    if (!srcEncoding || srcEncoding.getVersionMajor() != 3 ||
+        srcEncoding != getEncoding(dotOp.getResult()))
+      return failure();
+    // We currently only support convert from f16 mma to f16 dot operand as the
+    // other types require shuffling data across threads.
+    // TODO: extend it to more types.
+    auto srcType = convertLhs.getSrc().getType().cast<RankedTensorType>();
+    if (!srcType.getElementType().isF16())
+      return failure();
+    auto dotOperandEncoding =
+        DotOperandEncodingAttr::get(dotOp.getContext(), 0, srcEncoding, 0);
+    auto newType = RankedTensorType::get(
+        srcType.getShape(), srcType.getElementType(), dotOperandEncoding);
+    Value newOperand = rewriter.create<ConvertLayoutOp>(dotOp.getLoc(), newType,
+                                                        convertLhs.getSrc());
+    rewriter.updateRootInPlace(dotOp,
+                               [&]() { dotOp.setOperand(0, newOperand); });
+    return success();
+  }
+};
 } // namespace
 
 #define GEN_PASS_CLASSES
@@ -244,11 +288,11 @@ public:
 
     mlir::RewritePatternSet patterns(context);
     patterns.add<ConvertTransConvert>(context);
-    patterns.add<MoveOpAfterLayoutConversion>(context);
+    if (triton::gpu::TritonGPUDialect::getComputeCapability(m) >= 80)
+      patterns.add<MoveOpAfterLayoutConversion>(context);
     patterns.add<FuseTransHopper>(context);
+    patterns.add<MMAV3UseRegOperand>(context);
     if (applyPatternsAndFoldGreedily(m, std::move(patterns)).failed())
-      signalPassFailure();
-    if (fixupLoops(m).failed())
       signalPassFailure();
   }
 };

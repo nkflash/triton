@@ -113,6 +113,16 @@ compared to 1*64 when the hasLeadingOffset is false.
                      "ArrayRef<unsigned>":$order,
                      "CTALayoutAttr":$CTALayout,
                      "unsigned":$typeWidthInBit), [{
+        bool needTrans = false; // default value
+        return get(context, dotOpEnc, shape, order, CTALayout, typeWidthInBit, needTrans);
+    }]>,
+
+    AttrBuilder<(ins "DotOperandEncodingAttr":$dotOpEnc,
+                     "ArrayRef<int64_t>":$shape,
+                     "ArrayRef<unsigned>":$order,
+                     "CTALayoutAttr":$CTALayout,
+                     "unsigned":$typeWidthInBit,
+                     "bool":$needTrans), [{
         auto mmaEnc = dotOpEnc.getParent().dyn_cast<MmaEncodingAttr>();
 
         if(!mmaEnc)
@@ -143,25 +153,32 @@ compared to 1*64 when the hasLeadingOffset is false.
 
         // ---- begin Ampere ----
         if (mmaEnc.isAmpere()) {
-          int perPhase = 128 / (shapePerCTA[order[0]] * 4 / dotOpEnc.getMMAv2kWidth());
+          int perPhase = 128 / (shapePerCTA[order[0]] * 4 / dotOpEnc.getKWidth());
           perPhase = std::max<int>(perPhase, 1);
-          std::vector<size_t> matShape = {8, 8, 4 * dotOpEnc.getMMAv2kWidth()};
+          std::vector<size_t> matShape = {8, 8, 4 * dotOpEnc.getKWidth()};
           // for now, disable swizzle when using transposed int8 tensor cores
-          if ((32 / typeWidthInBit != dotOpEnc.getMMAv2kWidth()) && order[0] == inner)
+          if ((32 / typeWidthInBit != dotOpEnc.getKWidth()) && order[0] == inner)
             return get(context, 1, 1, 1, order, CTALayout);
 
           // --- handle A operand ---
           if (opIdx == 0) { // compute swizzling for A operand
-              int vec = (order[0] == 1) ? matShape[2] : matShape[0]; // k : m
-              int mmaStride = (order[0] == 1) ? matShape[0] : matShape[2];
+              int m = (needTrans) ? matShape[2] : matShape[0];
+              int k = (needTrans) ? matShape[0] : matShape[2];
+              int vec = (order[0] == 1) ? k : m;
+              int mmaStride = (order[0] == 1) ? m : k;
               int maxPhase = mmaStride / perPhase;
               return get(context, vec, perPhase, maxPhase, order, CTALayout);
           }
 
           // --- handle B operand ---
           if (opIdx == 1) {
-              int vec = (order[0] == 1) ? matShape[1] : matShape[2]; // n : k
-              int mmaStride = (order[0] == 1) ? matShape[2] : matShape[1];
+              // we compute vec and maxPhase m, n and k size of the mma
+              // instruction. when matmul operands is transposed, we should
+              // consider that to get m, n and k.
+              int n = needTrans ? matShape[2] : matShape[1];
+              int k = needTrans ? matShape[1] : matShape[2];
+              int vec = (order[0] == 1) ? n : k;
+              int mmaStride = (order[0] == 1) ? k : n;
               int maxPhase = mmaStride / perPhase;
               return get(context, vec, perPhase, maxPhase, order, CTALayout);
           }
@@ -187,6 +204,16 @@ compared to 1*64 when the hasLeadingOffset is false.
                      "Type":$eltTy), [{
       unsigned bitwidth = eltTy.getIntOrFloatBitWidth();
       return get(context, dotOpEnc, shape, order, CTALayout, bitwidth);
+    }]>,
+
+    AttrBuilder<(ins "DotOperandEncodingAttr":$dotOpEnc,
+                     "ArrayRef<int64_t>":$shape,
+                     "ArrayRef<unsigned>":$order,
+                     "CTALayoutAttr":$CTALayout,
+                     "Type":$eltTy,
+                     "bool":$needTrans), [{
+      unsigned bitwidth = eltTy.getIntOrFloatBitWidth();
+      return get(context, dotOpEnc, shape, order, CTALayout, bitwidth, needTrans);
     }]>,
 
     AttrBuilder<(ins "ArrayRef<int64_t>":$shape,
@@ -585,6 +612,7 @@ For example, the matrix L corresponding to blockTileSize=[32,16] is:
 
   let extraClassDeclaration = extraBaseClassDeclaration # [{
     bool isVolta() const;
+    bool isTuring() const;
     bool isAmpere() const;
     bool isHopper() const;
 
@@ -655,7 +683,7 @@ section 9.7.13.4.1 for more details.
     ins
     "unsigned":$opIdx,
     "Attribute":$parent,
-    "unsigned":$MMAv2kWidth
+    "unsigned":$kWidth
   );
 
   let builders = [
